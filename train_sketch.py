@@ -19,6 +19,7 @@ import gc
 import logging
 import math
 import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
 import random
 import shutil
 from pathlib import Path
@@ -26,13 +27,14 @@ from pathlib import Path
 import accelerate
 import numpy as np
 import torch
+torch.autograd.set_detect_anomaly(True)
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from PIL import Image
@@ -53,16 +55,16 @@ from diffusers.utils.import_utils import is_xformers_available
 
 from configs.utils import instantiate_from_config
 from omegaconf import OmegaConf
-from Adapter.extra_condition.model_edge import pidinet
 from models.unet import UNet
 from basicsr.utils import tensor2img
 import cv2
 from huggingface_hub import hf_hub_url
 import subprocess
 import shlex
+from dataset.dataset_layout import BuildingLayoutDataFormer
 
 urls = {
-    'TencentARC/T2I-Adapter':[
+    'TencentARC/T2I-Adapter': [
         'third-party-models/body_pose_model.pth', 'third-party-models/table5_pidinet.pth'
     ]
 }
@@ -74,10 +76,9 @@ for repo in urls:
     for file in files:
         url = hf_hub_url(repo, file)
         name_ckp = url.split('/')[-1]
-        save_path = os.path.join('checkpoints',name_ckp)
+        save_path = os.path.join('checkpoints', name_ckp)
         if os.path.exists(save_path) == False:
             subprocess.run(shlex.split(f'wget {url} -O {save_path}'))
-
 
 if is_wandb_available():
     import wandb
@@ -87,8 +88,9 @@ if is_wandb_available():
 
 logger = get_logger(__name__)
 
+
 def import_model_class_from_model_name_or_path(
-    pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
+        pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
 ):
     text_encoder_config = PretrainedConfig.from_pretrained(
         pretrained_model_name_or_path, subfolder=subfolder, revision=revision
@@ -316,6 +318,31 @@ def parse_args(input_args=None):
             " more information see https://huggingface.co/docs/accelerate/v0.17.0/en/package_reference/accelerator#accelerate.Accelerator"
         ),
     )
+    parser.add_argument(
+        "--train_data_dir",
+        type=str,
+        default=None,
+        help=(
+            "A folder containing the training data. Folder contents must follow the structure described in"
+            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
+            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
+        ),
+    )
+    parser.add_argument(
+        "--image_column", type=str, default="image", help="The column of the dataset containing the target image."
+    )
+    parser.add_argument(
+        "--conditioning_image_column",
+        type=str,
+        default="conditioning_image",
+        help="The column of the dataset containing the adapter conditioning image.",
+    )
+    parser.add_argument(
+        "--caption_column",
+        type=str,
+        default="text",
+        help="The column of the dataset containing a caption or a list of captions.",
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -375,9 +402,109 @@ def encode_prompt(prompt_batch, text_encoders, tokenizers, proportion_empty_prom
 
 
 def random_threshold(edge, low_threshold=0.3, high_threshold=0.8):
-        threshold = round(random.uniform(low_threshold, high_threshold), 1)
-        edge = edge > threshold
-        return edge
+    threshold = round(random.uniform(low_threshold, high_threshold), 1)
+    edge = edge > threshold
+    return edge
+
+
+def get_train_dataset(args, accelerator):
+    # Get the datasets: you can either provide your own training and evaluation files (see below)
+    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
+
+    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
+    # download the dataset.
+    data_obj = BuildingLayoutDataFormer(root=args.train_data_dir,
+                                        image_folder='建筑',
+                                        condition_folder='地块',
+                                        image_mask_folder='建筑_mask',
+                                        condition_json='./condition.json')
+    data_dict = data_obj.split_train_test(0.85)
+    dataset = Dataset.from_dict(data_dict['train'])
+
+    """
+    if args.train_data_dir is not None:
+        dataset = load_dataset(
+            args.train_data_dir,
+            cache_dir=args.cache_dir,
+        )
+    """
+    # See more about loading custom images at
+    # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
+
+    # Preprocessing the datasets.
+    # We need to tokenize inputs and targets.
+    column_names = dataset.column_names
+
+    # 6. Get the column names for input/target.
+    if args.image_column is None:
+        image_column = column_names[0]
+        logger.info(f"image column defaulting to {image_column}")
+    else:
+        image_column = args.image_column
+        if image_column not in column_names:
+            raise ValueError(
+                f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+            )
+
+    if args.caption_column is None:
+        caption_column = column_names[1]
+        logger.info(f"caption column defaulting to {caption_column}")
+    else:
+        caption_column = args.caption_column
+        if caption_column not in column_names:
+            raise ValueError(
+                f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+            )
+
+    if args.conditioning_image_column is None:
+        conditioning_image_column = column_names[2]
+        logger.info(f"conditioning image column defaulting to {conditioning_image_column}")
+    else:
+        conditioning_image_column = args.conditioning_image_column
+        if conditioning_image_column not in column_names:
+            raise ValueError(
+                f"`--conditioning_image_column` value '{args.conditioning_image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+            )
+
+    with accelerator.main_process_first():
+        train_dataset = dataset.shuffle(seed=args.seed)
+    return train_dataset
+
+
+def prepare_train_dataset(dataset, accelerator):
+    image_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+
+    conditioning_image_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution),
+            transforms.ToTensor(),
+        ]
+    )
+
+    def preprocess_train(examples):
+        images = [Image.open(image).convert("RGB") for image in examples[args.image_column]]
+        images = [image_transforms(image) for image in images]
+
+        conditioning_images = [Image.open(image).convert("RGB") for image in examples[args.conditioning_image_column]]
+        conditioning_images = [conditioning_image_transforms(image)[:1] for image in conditioning_images]
+
+        examples["pixel_values"] = images
+        examples["conditioning_pixel_values"] = conditioning_images
+
+        return examples
+
+    with accelerator.main_process_first():
+        dataset = dataset.with_transform(preprocess_train)
+
+    return dataset
 
 
 def main(args):
@@ -462,7 +589,7 @@ def main(args):
             while len(weights) > 0:
                 weights.pop()
                 model = models[i]
-                torch.save(model.state_dict(), os.path.join(output_dir, 'model_%02d.pth'%i))
+                torch.save(model.state_dict(), os.path.join(output_dir, 'model_%02d.pth' % i))
                 i -= 1
 
         accelerator.register_save_state_pre_hook(save_model_hook)
@@ -494,7 +621,7 @@ def main(args):
 
     if args.scale_lr:
         args.learning_rate = (
-            args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
+                args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
     # Use 8-bit Adam for lower memory usage or to fine-tune the model in 16GB GPUs
@@ -523,13 +650,6 @@ def main(args):
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-    # load sketch model
-    sketch_model = pidinet()
-    ckp = torch.load('checkpoints/table5_pidinet.pth', map_location='cpu')['state_dict']
-    sketch_model.load_state_dict({k.replace('module.', ''): v for k, v in ckp.items()}, strict=True)
-    sketch_model = sketch_model.cuda()
-    for param in sketch_model.parameters():
-        param.required_grad = False
 
     # For mixed precision training we cast the text_encoder and vae weights to half-precision
     # as these models are only used for inference, keeping weights in full precision is not required.
@@ -555,7 +675,7 @@ def main(args):
         original_size = (args.resolution, args.resolution)
         target_size = (args.resolution, args.resolution)
         crops_coords_top_left = (args.crops_coords_top_left_h, args.crops_coords_top_left_w)
-        prompt_batch = batch['txt']
+        prompt_batch = batch['captions']
 
         prompt_embeds, pooled_prompt_embeds = encode_prompt(
             prompt_batch, text_encoders, tokenizers, proportion_empty_prompts, is_train
@@ -572,7 +692,7 @@ def main(args):
         add_time_ids = add_time_ids.to(accelerator.device, dtype=prompt_embeds.dtype)
         unet_added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
 
-        return {"prompt_embeds": prompt_embeds}, unet_added_cond_kwargs#, **unet_added_cond_kwargs}
+        return {"prompt_embeds": prompt_embeds}, unet_added_cond_kwargs  # , **unet_added_cond_kwargs}
 
     # Let's first compute all the embeddings so that we can free up the text encoders
     # from memory.
@@ -581,9 +701,38 @@ def main(args):
     gc.collect()
     torch.cuda.empty_cache()
 
+    def collate_fn(examples):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+
+        captions = [example["caption"] for example in examples]
+
+        conditioning_pixel_values = torch.stack([example["conditioning_pixel_values"] for example in examples])
+        conditioning_pixel_values = conditioning_pixel_values.to(memory_format=torch.contiguous_format).float()
+
+        # prompt_ids = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples])
+
+        # add_text_embeds = torch.stack([torch.tensor(example["text_embeds"]) for example in examples])
+        # add_time_ids = torch.stack([torch.tensor(example["time_ids"]) for example in examples])
+
+        return {
+            "pixel_values": pixel_values,
+            "conditioning_pixel_values": conditioning_pixel_values,
+            "captions": captions
+            # "prompt_ids": prompt_ids,
+            # "unet_added_conditions": {"text_embeds": add_text_embeds, "time_ids": add_time_ids},
+        }
+
     # data
-    data = instantiate_from_config(config.data)
-    train_dataloader = data.train_dataloader()
+    train_dataset = get_train_dataset(args, accelerator)
+    train_dataset = prepare_train_dataset(train_dataset, accelerator)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        shuffle=True,
+        collate_fn=collate_fn,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+    )
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -647,20 +796,13 @@ def main(args):
     for epoch in range(first_epoch, args.num_train_epochs):
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(adapter):
-                # norm input
-                batch["jpg"] = batch["jpg"].cuda()
-                batch["jpg"] = batch["jpg"]*2.-1.
-                # get sketch
-                edge = 0.5 * batch['jpg'] + 0.5
-                edge = sketch_model(edge)[-1]
-                # add random threshold and random masking
-                edge = random_threshold(edge).to(dtype=weight_dtype)
+                condition_image = batch["conditioning_pixel_values"].to(dtype=weight_dtype)
 
                 # Convert images to latent space
                 if args.pretrained_vae_model_name_or_path is not None:
-                    pixel_values = batch["jpg"].to(dtype=weight_dtype)
+                    pixel_values = batch["pixel_values"].to(dtype=weight_dtype)
                 else:
-                    pixel_values = batch["jpg"]
+                    pixel_values = batch["pixel_values"]
                 latents = vae.encode(pixel_values).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
                 if args.pretrained_vae_model_name_or_path is None:
@@ -671,8 +813,8 @@ def main(args):
                 bsz = latents.shape[0]
 
                 # Cubic sampling to sample a random timestep for each image
-                timesteps = torch.rand((bsz, ), device=latents.device)
-                timesteps = (1 - timesteps**3) * noise_scheduler.config.num_train_timesteps
+                timesteps = torch.rand((bsz,), device=latents.device)
+                timesteps = (1 - timesteps ** 3) * noise_scheduler.config.num_train_timesteps
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
@@ -681,12 +823,12 @@ def main(args):
 
                 # get text embedding
                 prompt_embeds, unet_added_cond_kwargs = compute_embeddings(
-                    batch=batch,proportion_empty_prompts=0,text_encoders=text_encoders,tokenizers=tokenizers
+                    batch=batch, proportion_empty_prompts=0, text_encoders=text_encoders, tokenizers=tokenizers
                 )
 
                 # Adapter conditioning.
                 down_block_additional_residuals = adapter(
-                    edge
+                    condition_image
                 )
 
                 # Predict the noise residual
@@ -717,7 +859,6 @@ def main(args):
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=args.set_grads_to_none)
-
 
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
