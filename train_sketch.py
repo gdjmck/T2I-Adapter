@@ -124,6 +124,7 @@ def parse_args(input_args=None):
         default=None,
         help="Path to an improved VAE to stabilize training. For more details check out: https://github.com/huggingface/diffusers/pull/4038.",
     )
+    parser.add_argument('--load_state', type=str, default='', help='Load state using Accelerator.load_state function.')
     parser.add_argument(
         "--revision",
         type=str,
@@ -668,6 +669,9 @@ def main(args):
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+
+    if args.load_state:
+        Accelerator.load_state(args.load_state)
 
     # Here, we compute not just the text embeddings but also the additional embeddings
     # needed for the SD XL UNet to operate.
